@@ -4,8 +4,9 @@
 Pipeline:
   1. YOLO11x watermark detector finds watermark / stamp regions.
   2. Multi-scale template matching finds user-provided stamps (see --stamps).
-  3. If nothing is detected, the file is copied byte-for-byte (untouched).
-  4. Otherwise all detected regions are inpainted with LaMa (big-lama).
+  3. Detections overlapping protected logo templates (see --protect) are dropped.
+  4. If nothing remains, the file is copied byte-for-byte (untouched).
+  5. Otherwise all detected regions are inpainted with LaMa (big-lama).
 """
 
 import argparse
@@ -25,7 +26,7 @@ DETECTOR_REPO = "corzent/yolo11x_watermark_detection"
 DETECTOR_FILE = "best.pt"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 STAMP_EXTS = IMAGE_EXTS
-STAMP_SCALES = tuple(np.linspace(0.5, 1.6, 12).round(3))
+STAMP_SCALES = tuple(np.linspace(0.4, 2.0, 17).round(3))
 NMS_IOU = 0.3
 MAX_STAMP_HITS = 30
 
@@ -58,6 +59,26 @@ def parse_args() -> argparse.Namespace:
         help="Template-match similarity threshold (0-1). Lower = catch more, "
         "higher = fewer false positives.",
     )
+    p.add_argument(
+        "--protect",
+        default="protect",
+        help="Folder with logo templates that must NEVER be removed. Detections "
+        "overlapping a protected template are dropped, no matter how confident "
+        "the detector is. Missing or empty folder disables protection.",
+    )
+    p.add_argument(
+        "--protect-threshold",
+        type=float,
+        default=0.6,
+        help="Match threshold for protected logo templates (0-1). Lower than "
+        "--stamp-threshold on purpose: keeping a logo is safer than removing it.",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detection scores for every image — YOLO confidence per box "
+        "and best template-match score per stamp — for tuning thresholds.",
+    )
     return p.parse_args()
 
 
@@ -69,12 +90,17 @@ def load_detector(device: str) -> YOLO:
     return model
 
 
-def detect_boxes(model: YOLO, bgr_img: np.ndarray, conf: float, device: str) -> list[list[int]]:
+def detect_boxes(
+    model: YOLO, bgr_img: np.ndarray, conf: float, device: str
+) -> list[tuple[list[int], float]]:
+    """YOLO detections as [(x1, y1, x2, y2), confidence], filtered by conf."""
     results = model.predict(bgr_img, conf=conf, device=device, verbose=False)
     boxes = results[0].boxes
     if boxes is None or len(boxes) == 0:
         return []
-    return boxes.xyxy.cpu().numpy().round().astype(int).tolist()
+    xyxy = boxes.xyxy.cpu().numpy().round().astype(int)
+    confs = boxes.conf.cpu().numpy()
+    return [(b.tolist(), float(c)) for b, c in zip(xyxy, confs)]
 
 
 # ---------------------------------------------------------------------------
@@ -119,13 +145,67 @@ def _nms(cands: list[dict]) -> list[dict]:
     return keep
 
 
-def match_stamps(rgb: np.ndarray, templates: list[dict], threshold: float) -> list[dict]:
-    """Multi-scale template matching. Returns [{name, score, box=(x1,y1,x2,y2)}]."""
+def _ncc(img: np.ndarray, tpl: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+    """Similarity map in [0, 1]; higher = better match.
+
+    Masked templates (transparent-background PNGs) use TM_SQDIFF_NORMED — the
+    only masked mode that is discriminative enough — inverted to a
+    higher-is-better score.
+    """
+    if mask is not None:
+        sq = cv2.matchTemplate(img, tpl, cv2.TM_SQDIFF_NORMED, mask=mask)
+        return 1.0 - sq
+    return cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED)
+
+
+def _pearson(tpl: np.ndarray, patch: np.ndarray, mask: np.ndarray | None) -> float:
+    """Pearson correlation between template and patch over (masked) pixels."""
+    if tpl.shape != patch.shape:
+        return 0.0
+    if mask is not None:
+        sel = mask > 127
+    else:
+        sel = np.ones(tpl.shape, bool)
+    a = tpl[sel].astype(np.float64)
+    b = patch[sel].astype(np.float64)
+    if a.size < 25 or a.std() == 0 or b.std() == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _verify(cand: dict, img_gray: np.ndarray, img_edges: np.ndarray) -> float:
+    """Second-stage verification of a coarse candidate at its exact box."""
+    x1, y1, x2, y2 = cand["box"]
+    patch_g = img_gray[y1:y2, x1:x2]
+    patch_e = img_edges[y1:y2, x1:x2]
+    m = cand["m"]
+    return max(_pearson(cand["g"], patch_g, m), _pearson(cand["e"], patch_e, m))
+
+
+def match_stamps(
+    rgb: np.ndarray, templates: list[dict], threshold: float
+) -> tuple[list[dict], dict[str, float]]:
+    """Multi-scale template matching.
+
+    Returns (matches, best_scores):
+      matches     -- [{name, score, box=(x1,y1,x2,y2)}] after verification + NMS
+      best_scores -- {template_name: best coarse similarity seen in this image},
+                     even when below the threshold (tuning aid for --verbose)
+
+    Two stages per scale: a coarse matchTemplate sweep (raw grayscale + Canny
+    edges combined; masked SQDIFF for transparent-background templates), then
+    Pearson re-verification of the top candidates at their exact locations.
+    Edge matching is robust to background, brightness and re-compression
+    differences, so one template can recognize the same stamp across photos;
+    verification removes spurious texture hits that survive the coarse pass.
+    """
     if not templates:
-        return []
+        return [], {}
     img_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    img_edges = cv2.Canny(img_gray, 50, 150)
     h_img, w_img = img_gray.shape
     cands: list[dict] = []
+    best = {t["name"]: 0.0 for t in templates}
     peak_kernel = np.ones((5, 5), np.uint8)
     for tpl in templates:
         th, tw = tpl["gray"].shape
@@ -135,11 +215,19 @@ def match_stamps(rgb: np.ndarray, templates: list[dict], threshold: float) -> li
                 continue
             interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
             g = cv2.resize(tpl["gray"], (w, h), interpolation=interp)
-            if tpl["mask"] is not None:
-                m = cv2.resize(tpl["mask"], (w, h), interpolation=cv2.INTER_AREA)
-                res = cv2.matchTemplate(img_gray, g, cv2.TM_CCORR_NORMED, mask=m)
-            else:
-                res = cv2.matchTemplate(img_gray, g, cv2.TM_CCOEFF_NORMED)
+            e = cv2.Canny(g, 50, 150)
+            m = (
+                cv2.resize(tpl["mask"], (w, h), interpolation=cv2.INTER_AREA)
+                if tpl["mask"] is not None
+                else None
+            )
+            res = np.maximum(_ncc(img_gray, g, m), _ncc(img_edges, e, m))
+            # SQDIFF can yield NaN where the masked patch has zero variance;
+            # NaN must never become a "best score" or a detection peak.
+            res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+            s = float(res.max())
+            if s > best[tpl["name"]]:
+                best[tpl["name"]] = s
             dil = cv2.dilate(res, peak_kernel)
             ys, xs = np.where((res >= threshold) & (res >= dil - 1e-6))
             for y, x in zip(ys, xs):
@@ -148,9 +236,20 @@ def match_stamps(rgb: np.ndarray, templates: list[dict], threshold: float) -> li
                         "name": tpl["name"],
                         "score": float(res[y, x]),
                         "box": (int(x), int(y), int(x + w), int(y + h)),
+                        "g": g,
+                        "e": e,
+                        "m": m,
                     }
                 )
-    return _nms(cands)
+    # Verify only the most promising coarse candidates, then NMS.
+    cands.sort(key=lambda c: -c["score"])
+    verified = []
+    for c in cands[:500]:
+        v = _verify(c, img_gray, img_edges)
+        if v >= threshold:
+            c["score"] = v
+            verified.append(c)
+    return _nms(verified), best
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +274,30 @@ def save_image(img: Image.Image, dest: Path) -> None:
         img.save(dest)
 
 
+def filter_protected(
+    detections: list[tuple[str, list, float]],
+    protect_boxes: list,
+    margin: int = 16,
+) -> tuple[list[tuple[str, list, float]], int]:
+    """Drop detections whose center falls inside a protected logo box (+margin)."""
+    if not protect_boxes:
+        return detections, 0
+    kept = []
+    dropped = 0
+    for det in detections:
+        _, (x1, y1, x2, y2), _ = det
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        inside = any(
+            px1 - margin <= cx <= px2 + margin and py1 - margin <= cy <= py2 + margin
+            for px1, py1, px2, py2 in protect_boxes
+        )
+        if inside:
+            dropped += 1
+        else:
+            kept.append(det)
+    return kept, dropped
+
+
 def process_image(
     model: YOLO,
     lama,
@@ -182,6 +305,7 @@ def process_image(
     dest: Path,
     args: argparse.Namespace,
     stamp_templates: list[dict],
+    protect_templates: list[dict],
 ) -> str:
     pil_img = Image.open(src)
     pil_img = ImageOps.exif_transpose(pil_img)  # honor EXIF orientation once
@@ -191,11 +315,28 @@ def process_image(
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     detections: list[tuple[str, list, float]] = []
-    detections += [("watermark", b, 1.0) for b in detect_boxes(model, bgr, args.conf, args.device)]
+    yolo_dets = detect_boxes(model, bgr, args.conf, args.device)
+    detections += [("watermark", b, s) for b, s in yolo_dets]
+
+    stamp_matches, stamp_best = match_stamps(rgb, stamp_templates, args.stamp_threshold)
     detections += [
         (d["name"], list(d["box"]), d["score"])
-        for d in match_stamps(rgb, stamp_templates, args.stamp_threshold)
+        for d in stamp_matches
     ]
+
+    if protect_templates:
+        protect_hits, _ = match_stamps(rgb, protect_templates, args.protect_threshold)
+        if protect_hits:
+            detections, n_dropped = filter_protected(detections, [h["box"] for h in protect_hits])
+            if n_dropped and args.verbose:
+                print(f"    protected {n_dropped} detection(s) overlapping logo template(s)")
+
+    if args.verbose:
+        wm = ", ".join(f"{s:.2f}" for n, _, s in detections if n == "watermark")
+        print(f"    yolo watermark scores — {wm or 'none'}")
+        if stamp_best:
+            scores = "  ".join(f"{k}: {v:.2f}" for k, v in stamp_best.items())
+            print(f"    stamp best scores — {scores}")
 
     if not detections:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -249,6 +390,11 @@ def main() -> int:
     else:
         print(f"No stamp templates in '{args.stamps}' — YOLO detection only.")
 
+    protect_templates = load_stamp_templates(Path(args.protect))
+    if protect_templates:
+        print(f"Loaded {len(protect_templates)} protected logo template(s) from '{args.protect}' "
+              f"(threshold {args.protect_threshold}) — these regions are never modified.")
+
     print(f"Found {len(images)} image(s). Device: {args.device}")
 
     model = load_detector(args.device)
@@ -265,7 +411,7 @@ def main() -> int:
         rel = src.relative_to(input_dir)
         dest = output_dir / rel
         try:
-            status = process_image(model, lama, src, dest, args, stamp_templates)
+            status = process_image(model, lama, src, dest, args, stamp_templates, protect_templates)
         except Exception as e:  # keep batch going, report at the end
             failed += 1
             print(f"[{i}/{len(images)}] FAIL {rel}: {e}")

@@ -15,7 +15,33 @@ import argparse
 import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image, ImageOps
+
+
+def cut_background(img: Image.Image, tol: int = 20) -> Image.Image:
+    """Make the near-uniform, border-connected background transparent.
+
+    Flood-fills inwards from the four corners and turns every reached pixel
+    transparent. The result is an RGBA PNG where only the stamp artwork is
+    opaque — such templates match the same stamp on *other* photos far more
+    reliably, because background pixels no longer vote in the comparison.
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    flags = 4 | cv2.FLOODFILL_FIXED_RANGE | (255 << 8)
+    for seed in ((1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2)):
+        cv2.floodFill(
+            arr.copy(), ff_mask, seed, 0,
+            loDiff=(tol, tol, tol), upDiff=(tol, tol, tol), flags=flags,
+        )
+    bg = ff_mask[1:-1, 1:-1] > 0
+    # Dilate the background by 1px to also remove background-colored fringe on the stamp edge.
+    bg = cv2.dilate(bg.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    alpha = np.where(bg, 0, 255).astype(np.uint8)
+    return Image.fromarray(np.dstack([arr, alpha]), "RGBA")
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +57,13 @@ def parse_args() -> argparse.Namespace:
         "Omit to only print the image size.",
     )
     p.add_argument("--rel", action="store_true", help="Interpret --box as fractions (0-1).")
+    p.add_argument(
+        "--cut-bg",
+        action="store_true",
+        help="Remove the uniform background around the stamp (flood fill from "
+        "the borders) and save a transparent-background PNG. Recommended: such "
+        "templates match the same stamp across other photos much more reliably.",
+    )
     p.add_argument(
         "--out",
         default=None,
@@ -67,8 +100,16 @@ def main() -> int:
         return 1
 
     out = Path(args.out) if args.out else Path("stamps") / f"{src.stem}_stamp.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
     crop = img.crop(box)
+    if args.cut_bg:
+        crop = cut_background(crop)
+        if out.suffix.lower() != ".png":
+            print(f"Note: --cut-bg needs alpha, saving as {out.with_suffix('.png')} instead.")
+            out = out.with_suffix(".png")
+        opaque = 100 * (np.array(crop)[..., 3] > 0).mean()
+        print(f"Background removed — {opaque:.0f}% of the template is opaque stamp.")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
     crop.save(out)
     print(f"Saved {out}  {crop.width}x{crop.height}px  box={box}")
     print("Tip: keep the crop tight around the stamp — it will be matched at multiple scales.")

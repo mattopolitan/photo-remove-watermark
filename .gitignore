@@ -13,6 +13,7 @@ photos/*
 !photos/.gitkeep
 photos_cleaned/
 stamps/*
+protect/*
 
 # OS
 .DS_Store
