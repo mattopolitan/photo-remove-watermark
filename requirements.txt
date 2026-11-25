@@ -1,0 +1,10 @@
+# RTX 50 series (Blackwell, sm_120) needs CUDA 12.8 builds of PyTorch.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+
+ultralytics>=8.3.0
+simple-lama-inpainting
+huggingface-hub
+opencv-python
+Pillow
+numpy
