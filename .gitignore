@@ -12,6 +12,7 @@ venv/
 photos/*
 !photos/.gitkeep
 photos_cleaned/
+stamps/*
 
 # OS
 .DS_Store
