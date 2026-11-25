@@ -101,6 +101,9 @@ def process_image(
     mask = build_mask(rgb_img.width, rgb_img.height, boxes, args.padding, args.dilate)
     mask_img = Image.fromarray(mask)
     result = lama(rgb_img, mask_img)
+    # LaMa pads to multiples of 8; crop back to the original dimensions.
+    if result.size != rgb_img.size:
+        result = result.crop((0, 0, rgb_img.width, rgb_img.height))
 
     if alpha is not None:
         result = result.convert("RGBA")

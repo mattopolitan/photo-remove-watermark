@@ -1,10 +1,17 @@
 # RTX 50 series (Blackwell, sm_120) needs CUDA 12.8 builds of PyTorch.
+# Python 3.13 wheels; plain PyPI builds of torch 2.9.x ship CUDA 12.6 which
+# lacks sm_120 support, so pin the +cu128 local versions from the index below.
 --extra-index-url https://download.pytorch.org/whl/cu128
-torch>=2.7.0
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
 
 ultralytics>=8.3.0
-simple-lama-inpainting
 huggingface-hub
 opencv-python
 Pillow
 numpy
+fire
+# NOTE: simple-lama-inpainting is NOT listed here on purpose: it pins
+# numpy<2.0 / pillow<10.0, which have no compatible wheels on modern Python.
+# run.bat installs it with --no-deps (its runtime code works fine with
+# numpy 2.x / pillow 10+).
