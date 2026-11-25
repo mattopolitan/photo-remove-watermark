@@ -12,5 +12,8 @@ source .venv/bin/activate
 
 python -m pip install --upgrade pip -q
 pip install -q -r requirements.txt
+# simple-lama-inpainting pins numpy<2 / pillow<10, which break resolution on
+# Python 3.13+; install it without deps (runtime code is compatible).
+pip install -q --no-deps simple-lama-inpainting
 
 python remove_watermark.py --input photos --output photos_cleaned "$@"
